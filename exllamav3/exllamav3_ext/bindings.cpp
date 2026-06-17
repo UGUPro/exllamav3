@@ -99,6 +99,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemm_wmma", &exl3_gemm_wmma, "exl3_gemm_wmma");
+    m.def("exl3_gemv_fused", &exl3_gemv_fused, "exl3_gemv_fused");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");

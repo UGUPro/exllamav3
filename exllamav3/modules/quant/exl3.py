@@ -25,6 +25,10 @@ IS_ROCM = torch.version.hip is not None
 import os as _os
 USE_WMMA = IS_ROCM and _os.environ.get("EXL3_ROCM_WMMA", "0") == "1"
 
+# Max rows for the fused ROCm GEMV decode path (matches EXL3_GEMV_MAXM in the
+# kernel). Above this, reconstruct + hipBLAS is used.
+ROCM_GEMV_MAX_ROWS = 8
+
 class LinearEXL3:
 
     quant_type: str = "exl3"
@@ -135,11 +139,38 @@ class LinearEXL3:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
-        # Opt-in fused WMMA path (see USE_WMMA note above).
-        if USE_WMMA and not reconstruct and self.out_features % 128 == 0 and self.in_features % 16 == 0:
-            return self.wmma_matmul(x, out_dtype)
+        # ROCm fast paths. For small M (decode + small prefill) the fused GEMV
+        # decodes each weight tile once and accumulates directly, avoiding the
+        # dense-weight global round trip that reconstruct + hgemm incurs (~2x at
+        # M=1). Larger M falls back to reconstruct + hipBLAS (hipBLAS is near
+        # peak there and reconstruct amortizes the decode across all rows).
+        if IS_ROCM and not reconstruct and self.out_features % 128 == 0 and self.in_features % 16 == 0:
+            rows = x.numel() // x.shape[-1]
+            if rows <= ROCM_GEMV_MAX_ROWS:
+                return self.rocm_gemv_matmul(x, out_dtype)
+            if USE_WMMA:
+                return self.wmma_matmul(x, out_dtype)
 
         return self.reconstruct_hgemm(x, out_dtype)
+
+
+    def rocm_gemv_matmul(self, x: torch.Tensor, out_dtype):
+        shape = x.shape
+        rows = x.numel() // shape[-1]
+        out_shape = shape[:-1] + (self.out_features,)
+        x = x.view(rows, self.in_features)
+        dtype = out_dtype or self.default_out_dtype
+        xh = torch.empty_like(x)
+        ext.had_r_128(x, xh, self.suh, None, 1.0)
+        # Fused dequant + GEMV accumulates in fp32 (atomics).
+        y_acc = torch.zeros((rows, self.out_features), dtype = torch.float, device = x.device)
+        ext.exl3_gemv_fused(xh, self.trellis, y_acc, self.K, self.mcg, self.mul1)
+        y = y_acc.to(dtype).view(out_shape)
+        y_ = y.view(rows, self.out_features)
+        ext.had_r_128(y_, y_, None, self.svh, 1.0)
+        if self.bias is not None:
+            y += self.bias
+        return y
 
 
     def wmma_matmul(self, x: torch.Tensor, out_dtype):
