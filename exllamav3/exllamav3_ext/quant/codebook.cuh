@@ -22,6 +22,32 @@ uint32_t mul_const_u32(uint32_t x)
     #endif
 }
 
+// 3INST codebook bit-twiddle: lop3.b32 with LUT 0x6a computes c ^ (a & b).
+// Here a = x, b = 0x8fff8fff, c = 0x3b603b60.
+__device__ __forceinline__ uint32_t cb_lop3_6a(uint32_t x)
+{
+#ifdef USE_ROCM
+    return (x & 0x8fff8fffu) ^ 0x3b603b60u;
+#else
+    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+    return x;
+#endif
+}
+
+// vabsdiff4.u32 with second operand 0: sum of the four byte magnitudes of x,
+// plus the accumulator.
+__device__ __forceinline__ uint32_t cb_vabsdiff4_add(uint32_t x, uint32_t acc)
+{
+#ifdef USE_ROCM
+    uint32_t s = (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + ((x >> 24) & 0xffu);
+    return s + acc;
+#else
+    uint32_t sum;
+    asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum) : "r"(x), "r"(0), "r"(acc) : );
+    return sum;
+#endif
+}
+
 template <int cb>
 __device__ inline half decode_3inst(uint32_t x)
 {
@@ -29,7 +55,7 @@ __device__ inline half decode_3inst(uint32_t x)
     {
         x *= 89226354u;
         x += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        x = cb_lop3_6a(x);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -38,7 +64,7 @@ __device__ inline half decode_3inst(uint32_t x)
 //        x *= 0xCBAC1FEDu;
         x = mul_const_u32<0xCBAC1FEDu>(x);
 
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        x = cb_lop3_6a(x);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -47,7 +73,7 @@ __device__ inline half decode_3inst(uint32_t x)
         x *= 0x83DCD12Du;
         uint32_t sum;
         const uint32_t acc = 0x6400u;  // 0x6400 -> 1024.0 ..  0x67FF -> 2047.0
-        asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum) : "r"(x), "r"(0), "r"(acc) : );
+        sum = cb_vabsdiff4_add(x, acc);
         const __half k_inv_h = __ushort_as_half(0x1eee);  //  0.00677 = 1/147.7
         const __half k_bias_h = __ushort_as_half(0xc931);  // -10.39 = (-1024.0 - 510.0) * k_inv_h
         half_uint16 h((uint16_t) sum);
@@ -64,8 +90,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         x1 *= 89226354u;
         x0 += 64248484u;
         x1 += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+        x0 = cb_lop3_6a(x0);
+        x1 = cb_lop3_6a(x1);
         half2_uint32 xu0(x0);
         half2_uint32 xu1(x1);
         half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
@@ -78,8 +104,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
 //        x1 *= 0xCBAC1FEDu;
         x0 = mul_const_u32<0xCBAC1FEDu>(x0);
         x1 = mul_const_u32<0xCBAC1FEDu>(x1);
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+        x0 = cb_lop3_6a(x0);
+        x1 = cb_lop3_6a(x1);
         half2_uint32 xu0(x0);
         half2_uint32 xu1(x1);
         half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
@@ -93,8 +119,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         uint32_t sum0;
         uint32_t sum1;
         const uint32_t acc = 0x6400u;  // 0x6400 -> 1024.0 ..  0x67FF -> 2047.0
-        asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum0) : "r"(x0), "r"(0), "r"(acc) : );
-        asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum1) : "r"(x1), "r"(0), "r"(acc) : );
+        sum0 = cb_vabsdiff4_add(x0, acc);
+        sum1 = cb_vabsdiff4_add(x1, acc);
         half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));  //  0.00677 = 1/147.7
         half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));  // -10.39 = (-1024.0 - 510.0) * k_inv_h
         half_uint16 h0((uint16_t) sum0);
@@ -105,8 +131,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
 
 __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)
 {
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+    x0 = cb_lop3_6a(x0);
+    x1 = cb_lop3_6a(x1);
     half2_uint32 xu0(x0);
     half2_uint32 xu1(x1);
     half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);

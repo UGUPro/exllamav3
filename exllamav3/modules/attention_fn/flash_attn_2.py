@@ -1,8 +1,18 @@
 import torch
-from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 
+# flash-attn is unavailable on some platforms (e.g. ROCm/RDNA). When it can't be
+# imported these backends simply return None and the dispatcher falls through to
+# the next candidate (xformers / triton paged / torch SDPA).
+try:
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
+    has_flash_attn = True
+except (ImportError, ModuleNotFoundError):
+    has_flash_attn = False
+
 def fn_flash_attn_with_kvcache(args: AttnArgs) -> torch.Tensor | None:
+    if not has_flash_attn:
+        return None
     if (
         args.is_varlen() or
         not args.has_kv_cache() or
@@ -31,6 +41,8 @@ def fn_flash_attn_with_kvcache(args: AttnArgs) -> torch.Tensor | None:
 
 
 def fn_flash_attn_func(args: AttnArgs) -> torch.Tensor | None:
+    if not has_flash_attn:
+        return None
     if (
         args.is_varlen() or
         args.has_kv_cache() or
@@ -51,6 +63,8 @@ def fn_flash_attn_func(args: AttnArgs) -> torch.Tensor | None:
 
 
 def fn_flash_attn_varlen_func(args: AttnArgs) -> torch.Tensor | None:
+    if not has_flash_attn:
+        return None
     if (
         not args.is_varlen() or
         args.bsz > 1 or

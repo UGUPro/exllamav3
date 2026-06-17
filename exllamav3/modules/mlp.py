@@ -10,6 +10,11 @@ from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
+import torch as _torch
+# Fused exl3 GEMM block kernels (exl3_mgemm / BC_*) use tensor-core PTX and
+# are unavailable on ROCm; keep these contexts unbuilt so the modules fall
+# back to the per-linear reconstruct + hgemm path.
+IS_ROCM = _torch.version.hip is not None
 from ..util.tensor import g_tensor_cache
 
 class MLP(Module):
@@ -561,7 +566,7 @@ class GatedMLP(Module):
     def load_local(self, device: torch.Device, load_slice: int, **kwargs):
         # Test if gate and up proj can be fused
         if (
-            device != torch.device("cpu") and
+            device != torch.device("cpu") and not IS_ROCM and
             self.gates[load_slice].quant_type == "exl3" and
             self.ups[load_slice].quant_type == "exl3" and
             self.gates[load_slice].out_features == self.ups[load_slice].out_features and

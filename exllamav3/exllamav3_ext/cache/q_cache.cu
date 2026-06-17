@@ -39,7 +39,8 @@ void quant_cache_cont
 
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
-    quant_cache_cont_kernel_instances[bits - 2]<<<bsz, 32, 0, stream>>>
+    auto quant_cont_kernel = quant_cache_cont_kernel_instances[bits - 2];
+    quant_cont_kernel<<<bsz, 32, 0, stream>>>
     (
         (const half*) in.data_ptr(),
         (uint32_t*) out.data_ptr(),
@@ -79,7 +80,8 @@ void dequant_cache_cont
 
     TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
-    dequant_cache_cont_kernel_instances[bits - 2]<<<bsz, 32, 0, stream>>>
+    auto dequant_cont_kernel = dequant_cache_cont_kernel_instances[bits - 2];
+    dequant_cont_kernel<<<bsz, 32, 0, stream>>>
     (
         (const uint32_t*) in.data_ptr(),
         (const half*) in_scales.data_ptr(),
@@ -152,7 +154,8 @@ void quant_cache_paged
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
 
-    quant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    auto quant_paged_kernel = quant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2];
+    quant_paged_kernel<<<blocks, threads, 0, stream>>>
     (
         (const half*) k_in.data_ptr(),
         (uint32_t*) k_out.data_ptr(),
@@ -235,7 +238,8 @@ void dequant_cache_paged
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
 
-    dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    auto dequant_paged_kernel = dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2];
+    dequant_paged_kernel<<<blocks, threads, 0, stream>>>
     (
         (const uint32_t*) k_in.data_ptr(),
         (const half*) k_in_scales.data_ptr(),

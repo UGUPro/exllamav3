@@ -2,7 +2,13 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
-from flash_attn import flash_attn_with_kvcache
+try:
+    from flash_attn import flash_attn_with_kvcache
+except (ImportError, ModuleNotFoundError):
+    # flash-attn is unavailable on ROCm/RDNA; these names are only used by
+    # sliding-window / arch-specific paths that fall back elsewhere.
+    flash_attn_with_kvcache = None
+
 from .. import LayerNorm
 from ..module import no_p2p_copy
 from ...model.config import Config

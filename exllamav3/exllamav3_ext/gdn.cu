@@ -1,5 +1,7 @@
 #include <cuda_fp16.h>
+#ifndef USE_ROCM
 #include <cuda_fp16.hpp>
+#endif
 #include "activation.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -7,6 +9,12 @@
 #include "util.cuh"
 #include "compat.cuh"
 #include <cmath>
+
+#ifdef USE_ROCM
+// HIP lacks the scalar float->bf16 rounding-mode intrinsics; round-to-nearest is fine here
+#define __float2bfloat16_rn __float2bfloat16
+#define __float2bfloat16_rz __float2bfloat16
+#endif
 
 using bfloat16 = __nv_bfloat16;
 #define MAX_K_HEADS 32

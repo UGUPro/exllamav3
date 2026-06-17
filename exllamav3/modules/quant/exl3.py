@@ -10,6 +10,21 @@ AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
+# The fused exl3 GEMM/GEMV kernels rely on NVIDIA tensor-core PTX and are not
+# available on ROCm/HIP. On ROCm the default path is reconstruct + hgemm
+# (hipBLAS), which uses only the portable dequant + dense matmul kernels.
+IS_ROCM = torch.version.hip is not None
+
+# Opt-in fused RDNA3 WMMA dequant+matmul (ext.exl3_gemm_wmma). It is numerically
+# correct but, as implemented, not faster than reconstruct + hipBLAS: a tiled
+# fused GEMM re-decodes each weight tile per M-tile, while reconstruct decodes
+# the weight once and hands hipBLAS the dense result. It only avoids the weight's
+# global round trip (a win solely at very small M) and even there the naive
+# kernel just ties. Left off by default to avoid regressing throughput; enable
+# with EXL3_ROCM_WMMA=1 for experimentation / further optimization.
+import os as _os
+USE_WMMA = IS_ROCM and _os.environ.get("EXL3_ROCM_WMMA", "0") == "1"
+
 class LinearEXL3:
 
     quant_type: str = "exl3"
@@ -114,13 +129,33 @@ class LinearEXL3:
                 return ovr[self.key].forward(x, params, out_dtype)
 
         reconstruct = params.get("reconstruct")
-        if not reconstruct:
+        if not reconstruct and not IS_ROCM:
             rows = x.numel() // x.shape[-1]
             if rows <= AUTO_RECONSTRUCT_THRESHOLD:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
+        # Opt-in fused WMMA path (see USE_WMMA note above).
+        if USE_WMMA and not reconstruct and self.out_features % 128 == 0 and self.in_features % 16 == 0:
+            return self.wmma_matmul(x, out_dtype)
+
         return self.reconstruct_hgemm(x, out_dtype)
+
+
+    def wmma_matmul(self, x: torch.Tensor, out_dtype):
+        shape = x.shape
+        rows = x.numel() // shape[-1]
+        out_shape = shape[:-1] + (self.out_features,)
+        x = x.view(rows, self.in_features)
+        y = torch.empty(out_shape, dtype = out_dtype or self.default_out_dtype, device = x.device)
+        y_ = y.view(rows, self.out_features)
+        xh = torch.empty_like(x)
+        ext.had_r_128(x, xh, self.suh, None, 1.0)
+        ext.exl3_gemm_wmma(xh, self.trellis, y_, self.K, self.mcg, self.mul1)
+        ext.had_r_128(y_, y_, None, self.svh, 1.0)
+        if self.bias is not None:
+            y += self.bias
+        return y
 
 
     def unpack_bf(self, bitfield: torch.Tensor):

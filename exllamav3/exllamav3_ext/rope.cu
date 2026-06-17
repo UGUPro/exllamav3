@@ -138,7 +138,7 @@ void rope_kernel
             if (t < head_dim / 2)
                 ((half2*) sh_head)[t] = ((half2*)g_head_in_ptr)[t];
             else
-                ((half2*) sh_head)[t] = {};
+                ((half2*) sh_head)[t] = __float2half2_rn(0.0f);
             __syncthreads();
         };
         auto store_head = [&] ()
@@ -206,11 +206,20 @@ void rope_kernel
             float v1 = __low2float(v);
             float v2 = __high2float(v);
             float sum = v1 * v1 + v2 * v2;
+#ifdef USE_ROCM
+            // Robust per-head reduction (independent of warp size / lane layout)
+            if (threadIdx.x == 0) sums[t_head] = 0.0f;
+            __syncthreads();
+            atomicAdd(&sums[t_head], sum);
+            __syncthreads();
+            sum = sums[t_head];
+#else
             sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
             __syncthreads();
 
             sum = sums[warps * t_head];
             for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
+#endif
 
             // Normalize and downcast
             float rmf = rsqrtf(sum / (float) head_dim + norm_eps);
@@ -254,11 +263,19 @@ void rope_kernel
             float v1 = __low2float(v);
             float v2 = __high2float(v);
             float sum = v1 * v1 + v2 * v2;
+#ifdef USE_ROCM
+            if (threadIdx.x == 0) sums[t_head] = 0.0f;
+            __syncthreads();
+            atomicAdd(&sums[t_head], sum);
+            __syncthreads();
+            sum = sums[t_head];
+#else
             sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
             __syncthreads();
 
             sum = sums[warps * t_head];
             for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
+#endif
 
             // Normalize and downcast
             float rmf = rsqrtf(sum / (float) head_dim + norm_eps);

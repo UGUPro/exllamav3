@@ -7,6 +7,11 @@ from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear
+import torch as _torch
+# Fused exl3 GEMM block kernels (exl3_mgemm / BC_*) use tensor-core PTX and
+# are unavailable on ROCm; keep these contexts unbuilt so the modules fall
+# back to the per-linear reconstruct + hgemm path.
+IS_ROCM = _torch.version.hip is not None
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
@@ -376,7 +381,7 @@ class Attention(Module):
         # Test if K and V proj can be fused
         if (
             not self.use_k_as_v and
-            device != torch.device("cpu") and
+            device != torch.device("cpu") and not IS_ROCM and
             self.k_proj.quant_type == "exl3" and
             self.v_proj is not None and
             self.v_proj.quant_type == "exl3" and
@@ -392,7 +397,7 @@ class Attention(Module):
         # Test if Q and G proj can be fused
         if (
             self.g_proj is not None and
-            device != torch.device("cpu") and
+            device != torch.device("cpu") and not IS_ROCM and
             self.q_proj.quant_type == "exl3" and
             self.g_proj.quant_type == "exl3" and
             self.q_proj.out_features == self.g_proj.out_features and
@@ -679,7 +684,7 @@ class Attention(Module):
         )
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -753,7 +758,7 @@ class Attention(Module):
         )
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)

@@ -15,6 +15,11 @@ from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 
+# The fused MoE kernels (exl3_moe / exl3_mgemm / BC_BlockSparseMLP) use NVIDIA
+# tensor-core PTX and are unavailable on ROCm. On ROCm keep these contexts
+# unbuilt and route MoE through the per-expert reconstruct + hgemm torch path.
+IS_ROCM = torch.version.hip is not None
+
 TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
 
@@ -495,7 +500,7 @@ class BlockSparseMLP(Module):
         )
         self.experts_cfg = cfg
 
-        if self.is_quantized:
+        if self.is_quantized and not IS_ROCM:
 
             # Embed bound classes for shared experts and shared gate
             sh_exp_bc = None
@@ -700,7 +705,9 @@ class BlockSparseMLP(Module):
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
         # Torch/C++/fused path
-        elif bsz >= self.f_threshold or not self.is_quantized:
+        # On ROCm always take this branch: bc and fused_mode_buffers are None, so
+        # the per-expert reconstruct + hgemm torch path below handles every expert.
+        elif bsz >= self.f_threshold or not self.is_quantized or IS_ROCM:
             final_hidden_states = torch.zeros_like(y, dtype = torch.float)
 
             # if self.routing_device is None or self.num_local_experts == self.num_experts:

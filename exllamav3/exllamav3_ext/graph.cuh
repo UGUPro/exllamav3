@@ -7,6 +7,11 @@ namespace py = pybind11;
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#ifdef USE_ROCM
+// hipify does not translate this symbol
+using cudaKernelNodeParams = hipKernelNodeParams;
+#endif
+
 using PPTR = std::tuple<int, void*>;
 
 enum GraphedParams

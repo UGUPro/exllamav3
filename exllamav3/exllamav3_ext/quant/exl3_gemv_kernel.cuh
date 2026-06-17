@@ -19,6 +19,7 @@ __device__ inline void ptx_mma_m8n8k16
     FragC_m8& frag_c
 )
 {
+#ifndef USE_ROCM
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -32,6 +33,7 @@ __device__ inline void ptx_mma_m8n8k16
         :  "r"(a[0]), "r"(a[1]),
            "r"(b[0]), "r"(b[1])
     );
+#endif
 }
 
 __device__ inline float2 shfl_float2(float2 v, int src, int width)

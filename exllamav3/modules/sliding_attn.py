@@ -6,7 +6,15 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
+except (ImportError, ModuleNotFoundError):
+    # flash-attn is unavailable on ROCm/RDNA; these names are only used by
+    # sliding-window / arch-specific paths that fall back elsewhere.
+    flash_attn_func = None
+    flash_attn_with_kvcache = None
+    flash_attn_varlen_func = None
+
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache

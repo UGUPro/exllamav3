@@ -1,9 +1,33 @@
 
+// HIP (ROCm 7.x) does not provide the __half2 overloads of __hmin2/__hmax2,
+// so use portable componentwise helpers that compile on both backends.
+__device__ __forceinline__ half2 h2_min(half2 a, half2 b)
+{
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+    half al = __low2half(a), ah = __high2half(a);
+    half bl = __low2half(b), bh = __high2half(b);
+    return __halves2half2(__hlt(al, bl) ? al : bl, __hlt(ah, bh) ? ah : bh);
+#else
+    return __hmin2(a, b);
+#endif
+}
+
+__device__ __forceinline__ half2 h2_max(half2 a, half2 b)
+{
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+    half al = __low2half(a), ah = __high2half(a);
+    half bl = __low2half(b), bh = __high2half(b);
+    return __halves2half2(__hgt(al, bl) ? al : bl, __hgt(ah, bh) ? ah : bh);
+#else
+    return __hmax2(a, b);
+#endif
+}
+
 __device__ inline half2 clamp_half2_to_finite(half2 v)
 {
     const half2 max_h2 = __float2half2_rn(65504.0f);
     const half2 min_h2 = __float2half2_rn(-65504.0f);
-    return __hmax2(__hmin2(v, max_h2), min_h2);
+    return h2_max(h2_min(v, max_h2), min_h2);
 }
 
 
@@ -139,9 +163,9 @@ void act_mul_kernel_h
 
     if (act_limit != 0.0f)
     {
-        y2 = __hmax2(y2, __float2half2_rn(-act_limit));
-        y2 = __hmin2(y2, __float2half2_rn(act_limit));
-        x2 = __hmin2(x2, __float2half2_rn(act_limit));
+        y2 = h2_max(y2, __float2half2_rn(-act_limit));
+        y2 = h2_min(y2, __float2half2_rn(act_limit));
+        x2 = h2_min(x2, __float2half2_rn(act_limit));
     }
 
     ((half2*) z)[idx] = __hmul2(x2, y2);

@@ -317,7 +317,7 @@ void quantize_tiles
     if (mcg) cb = 1;
     if (mul1) cb = 2;
     auto kernel = quantize_tiles_kernel_instances[K - 1 + 8 * cb];
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+    cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
     cuda_check(cudaPeekAtLastError());
 
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)

@@ -17,12 +17,28 @@ if precompile and not torch:
 
 windows = os.name == "nt"
 
+is_rocm = bool(torch and torch_version.hip)
+
 extra_cflags = []
-extra_cuda_cflags = [
-    "-lineinfo", "-O3", "--use_fast_math",
-    "-Xcudafe", "--diag_suppress=177",
-    "-Xcudafe", "--diag_suppress=20012",
-]
+if is_rocm:
+    # hipcc / amdclang++ does not accept nvcc-only flags
+    extra_cuda_cflags = [
+        "-O3", "-ffast-math",
+        "-Wno-register",            # kernels use the (C++17-removed) 'register' keyword
+        "-Wno-unused-result",
+        # Code uses 32-bit warp masks (0xffffffff); HIP's masked warp-sync
+        # builtins static_assert on 64-bit masks. Disable them and remap the
+        # *_sync names onto HIP's legacy warp builtins via rocm_compat.cuh.
+        "-DHIP_DISABLE_WARP_SYNC_BUILTINS",
+        "-include", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "exllamav3", extension_name, "rocm_compat.h"),
+    ]
+else:
+    extra_cuda_cflags = [
+        "-lineinfo", "-O3", "--use_fast_math",
+        "-Xcudafe", "--diag_suppress=177",
+        "-Xcudafe", "--diag_suppress=20012",
+    ]
 
 if windows:
     extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN"]
@@ -42,11 +58,34 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
 
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+    # The self-contained ROCm wheel ships core HIP headers but not the math-lib
+    # headers (hipsparse/hipblas/rocblas) that ATen's HIP headers include. Pull
+    # them from a system ROCm install if present (appended, so wheel headers win).
+    _sys_rocm_inc = os.environ.get("SYSTEM_ROCM_INCLUDE", "/opt/rocm/include")
+    if os.path.isdir(_sys_rocm_inc):
+        extra_cflags += [f"-I{_sys_rocm_inc}"]
+        extra_cuda_cflags += [f"-I{_sys_rocm_inc}"]
 
 extra_compile_args = {
     "cxx": extra_cflags,
     "nvcc": extra_cuda_cflags,
 }
+
+# On ROCm the self-contained wheel splits the HIP runtime (rocm_sdk_core) and the
+# math libraries (rocm_sdk_libraries_<arch>) across separate site-packages dirs.
+# Point the linker at both (with rpath) so libamdhip64/libhipblas/etc. resolve at
+# link and run time.
+rocm_library_dirs = []
+if is_rocm:
+    for _pkg in ("_rocm_sdk_core", "_rocm_sdk_libraries_gfx1151"):
+        try:
+            _spec = importlib.util.find_spec(_pkg)
+            if _spec and _spec.submodule_search_locations:
+                _libdir = os.path.join(list(_spec.submodule_search_locations)[0], "lib")
+                if os.path.isdir(_libdir):
+                    rocm_library_dirs.append(_libdir)
+        except Exception:
+            pass
 
 library_dir = "exllamav3"
 sources_dir = os.path.join(library_dir, extension_name)
@@ -67,6 +106,8 @@ setup_kwargs = (
                 sources,
                 extra_compile_args=extra_compile_args,
                 libraries=["cublas"] if windows else [],
+                library_dirs=rocm_library_dirs,
+                extra_link_args=[f"-Wl,-rpath,{d}" for d in rocm_library_dirs],
             )
         ],
         "cmdclass": {"build_ext": cpp_extension.BuildExtension},

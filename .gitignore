@@ -9,3 +9,12 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+
+# ROCm/HIP build venv
+.venv-rocm/
+
+# Files generated in-tree by torch's hipify during the ROCm build
+*.hip
+*_hip.cuh
+*_hip.cpp
+*_hip.h

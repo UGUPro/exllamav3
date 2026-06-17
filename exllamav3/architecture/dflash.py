@@ -11,7 +11,13 @@ from ..modules.arch_specific.dflash import DFlashInputLayer, DFlashAttention
 from ..modules.attn import prepare_for_attn
 from ..modules.module import no_p2p_copy
 from ..ext import exllamav3_ext as ext
-from flash_attn import flash_attn_with_kvcache
+try:
+    from flash_attn import flash_attn_with_kvcache
+except (ImportError, ModuleNotFoundError):
+    # flash-attn is unavailable on ROCm/RDNA; these names are only used by
+    # sliding-window / arch-specific paths that fall back elsewhere.
+    flash_attn_with_kvcache = None
+
 import weakref
 
 from ..util.tensor import get_for_device

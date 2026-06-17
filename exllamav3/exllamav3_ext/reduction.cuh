@@ -84,12 +84,23 @@ __device__ inline half block_reduce_max_h(half v, int num_threads)
 
 __device__ inline float warp_reduce_sum_f(float v)
 {
+#ifdef USE_ROCM
+    // Butterfly reduction leaves the full sum in every lane. Some callers (e.g.
+    // the fused RMS norm in rope.cu) have all lanes write the result to one
+    // shared slot; with a __shfl_down reduction only lane 0 holds the true sum,
+    // and the racing writes are only well-defined on NVIDIA. __shfl_xor makes
+    // every lane hold the sum so those writes are benign.
+    for (int offset = 32 >> 1; offset > 0; offset >>= 1)
+        v += __shfl_xor_sync(0xffffffff, v, offset);
+    return v;
+#else
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
         float other_v = __shfl_down_sync(0xffffffff, v, offset);
         v += other_v;
     }
     return v;
+#endif
 }
 
 __device__ inline float warp_reduce_sum_last_k(float v, int K)

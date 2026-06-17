@@ -1,5 +1,7 @@
 #pragma once
+#ifndef USE_ROCM
 #include <cuda/atomic>
+#endif
 
 // Tensor core fragments
 
@@ -15,6 +17,14 @@ using FragB = Vec<half2, 2>;
 using FragC = Vec<float, 4>;
 using FragC_h = Vec<half2, 2>;
 
+// On ROCm/HIP (RDNA3.5, gfx1151) the NVIDIA tensor-core MMA, ldmatrix and
+// cp.async PTX have no direct equivalent. exllamav3's fused exl3 GEMM/GEMV
+// kernels are therefore not used on ROCm (the Linear layer falls back to the
+// reconstruct + hgemm/hipBLAS path); these MMA/ldmatrix helpers only need to
+// compile so the kernels link. The other PTX helpers (integer math, memory
+// ordering, bitfield ops, timers) are given portable HIP implementations since
+// they are used by code paths that do run.
+
 // m8n8k4 tensor core matmul (emulated on Ampere and later), don't use
 //
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m8n8k4-with-f16-floating-point-type
@@ -26,6 +36,7 @@ __device__ inline void ptx_mma_m8n8k4
     Vec<float, 8>& frag_c
 )
 {
+#ifndef USE_ROCM
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -42,6 +53,7 @@ __device__ inline void ptx_mma_m8n8k4
            "r"(b[0]), "r"(b[1]),
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]), "f"(d[4]), "f"(d[5]), "f"(d[6]), "f"(d[7])
     );
+#endif
 }
 
 // m16n8k16 tensor core matmul
@@ -56,6 +68,7 @@ __device__ inline void ptx_mma_m16n8k16
     FragC& frag_c
 )
 {
+#ifndef USE_ROCM
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -71,6 +84,7 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(b[0]), "r"(b[1]),
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
     );
+#endif
 }
 
 // FP16 @ FP16 + FP16 -> FP16
@@ -81,6 +95,7 @@ __device__ inline void ptx_mma_m16n8k16
     FragC_h& frag_c
 )
 {
+#ifndef USE_ROCM
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
@@ -96,6 +111,7 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(b[0]), "r"(b[1]),
            "r"(d[0]), "r"(d[1])
     );
+#endif
 }
 
 // Global barrier
@@ -108,12 +124,16 @@ __device__ inline void barrier_acquire
 {
     if (threadIdx.x == 0)
     {
+#ifdef USE_ROCM
+        while (__atomic_load_n(lock, __ATOMIC_ACQUIRE) != stage);
+#else
         volatile int state = -1;
         do
         {
             asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
         }
         while (state != stage);
+#endif
     }
     __syncthreads();
 }
@@ -133,8 +153,13 @@ __device__ inline void barrier_release
             *lock = 0;
             return;
         }
+#ifdef USE_ROCM
+        __threadfence();
+        atomicAdd(lock, val);
+#else
         asm volatile ("fence.acq_rel.gpu;\n");
         asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val));
+#endif
     }
 }
 
@@ -143,6 +168,11 @@ __device__ inline void barrier_release
 
 __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool pred = true)
 {
+#ifdef USE_ROCM
+    // HIP has no async smem copy; perform a synchronous 16-byte copy.
+    if (pred)
+        *reinterpret_cast<uint4*>(smem_ptr) = *reinterpret_cast<const uint4*>(glob_ptr);
+#else
     const int bytes = 16;
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile(
@@ -152,12 +182,16 @@ __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool 
         "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
         "}\n" :: "r"((int) pred), "r"(smem), "l"(glob_ptr), "n"(bytes)
     );
+#endif
 }
 
 // Load global to shared memory
 
 __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
 {
+#ifdef USE_ROCM
+    *reinterpret_cast<uint4*>(smem_ptr) = *reinterpret_cast<const uint4*>(glob_ptr);
+#else
     const int bytes = 16;
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile(
@@ -165,12 +199,16 @@ __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
         "   cp.async.cg.shared.global [%0], [%1], %2;\n"
         "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes)
     );
+#endif
 }
 
 // Load global to shared memory with cache hint to evict data from L2 ASAP
 
 __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
 {
+#ifdef USE_ROCM
+    *reinterpret_cast<uint4*>(smem_ptr) = *reinterpret_cast<const uint4*>(glob_ptr);
+#else
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     const int bytes = 16;
     asm volatile
@@ -181,13 +219,16 @@ __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
         "   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
         "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes)
     );
+#endif
 }
 
 // Async copy fence, commit all pending async copies
 
 __device__ inline void cp_async_fence()
 {
+#ifndef USE_ROCM
     asm volatile("cp.async.commit_group;\n" ::);
+#endif
 }
 
 // Wait until at most n async groups are still pending.
@@ -195,13 +236,21 @@ __device__ inline void cp_async_fence()
 template <int n>
 __device__ inline void cp_async_wait()
 {
+#ifndef USE_ROCM
     asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
+#endif
 }
 
 // Load 16x16 matrix fragment from shared memory, directly in tensor core layout
 
 __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 {
+#ifdef USE_ROCM
+    // No ldmatrix on RDNA; only needs to compile (fused MMA path unused).
+    const uint32_t* s = reinterpret_cast<const uint32_t*>(smem_ptr);
+    uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
+    a[0] = s[0]; a[1] = s[1]; a[2] = s[2]; a[3] = s[3];
+#else
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile
@@ -209,10 +258,14 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
     );
+#endif
 }
 
 __device__ inline uint32_t mul_lo_u32(uint32_t x, uint32_t y)
 {
+#ifdef USE_ROCM
+    return x * y;
+#else
     uint32_t w;
     asm volatile
     (
@@ -221,10 +274,14 @@ __device__ inline uint32_t mul_lo_u32(uint32_t x, uint32_t y)
         :  "r"(x), "r"(y)
     );
     return w;
+#endif
 }
 
 __device__ inline uint32_t mul_hi_u32(uint32_t x, uint32_t y)
 {
+#ifdef USE_ROCM
+    return __umulhi(x, y);
+#else
     uint32_t w;
     asm volatile
     (
@@ -233,70 +290,108 @@ __device__ inline uint32_t mul_hi_u32(uint32_t x, uint32_t y)
         :  "r"(x), "r"(y)
     );
     return w;
+#endif
 }
 
 // Memory ops
 
 __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
 {
+#ifdef USE_ROCM
+    __atomic_store_n(p, v, __ATOMIC_RELAXED);
+#else
     asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(p), "r"(v));
+#endif
 }
 
 __device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
 {
+#ifdef USE_ROCM
+    *p = v;
+    __threadfence();
+#else
     asm volatile ("st.global.wt.v4.u32 [%0], {%1,%2,%3,%4};"
                   :: "l"(p),
                      "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
+#endif
 }
 
 __device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
 {
+#ifdef USE_ROCM
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+#else
     uint32_t v;
     asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
     return v;
+#endif
 }
 
 __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
 {
+#ifdef USE_ROCM
+    return *p;
+#else
     uint4 v;
     asm volatile ("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];"
                   : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                   : "l"(p));
     return v;
+#endif
 }
 
 __device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
 {
+#ifdef USE_ROCM
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#else
     uint32_t v;
     asm volatile("ld.global.acquire.sys.u32 %0, [%1];"
                  : "=r"(v) : "l"(p));
     return v;
+#endif
 }
 
 __device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
 {
+#ifdef USE_ROCM
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#else
     uint64_t v;
     asm volatile("ld.global.acquire.sys.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
     return v;
+#endif
 }
 
 __device__ __forceinline__ void stg_release_sys_u32(uint32_t* p, uint32_t v)
 {
+#ifdef USE_ROCM
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#else
     asm volatile("st.global.release.sys.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+#endif
 }
 
 __device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
 {
+#ifdef USE_ROCM
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#else
     asm volatile("st.global.release.sys.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+#endif
 }
 
 // Global time in nanoseconds
 
 __device__ __forceinline__ uint64_t globaltimer_ns()
 {
+#ifdef USE_ROCM
+    return static_cast<uint64_t>(clock64());
+#else
     uint64_t t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
+#endif
 }
 
 // Bitfield stuff
@@ -304,15 +399,26 @@ __device__ __forceinline__ uint64_t globaltimer_ns()
 static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int offset, int length)
 {
     uint64_t value = (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo);
+#ifdef USE_ROCM
+    uint64_t mask = (length >= 64) ? ~0ull : ((1ull << length) - 1);
+    return static_cast<uint32_t>((value >> offset) & mask);
+#else
     uint64_t result64;
     asm ("bfe.u64 %0, %1, %2, %3;"
          : "=l"(result64)
          : "l"(value), "r"(offset), "r"(length));
     return static_cast<uint32_t>(result64);
+#endif
 }
 
+#ifdef USE_ROCM
+#define FSHF_IMM(dst, lo, hi, imm) \
+    (dst) = static_cast<uint32_t>((((static_cast<uint64_t>(hi)) << 32) | static_cast<uint32_t>(lo)) >> ((imm) & 31))
+#define BFE16_IMM(dst, src, imm) (dst) = (((src) >> (imm)) & 0xffffu)
+#else
 #define FSHF_IMM(dst, lo, hi, imm) asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
 #define BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
+#endif
 
 // Inter-block barrier
 
@@ -327,6 +433,23 @@ __device__ inline void group_barrier
 
     if (threadIdx.x == 0)
     {
+#ifdef USE_ROCM
+        int* counter = &barrier_counters_sense[group_id * 2];
+        int* sense   = &barrier_counters_sense[group_id * 2 + 1];
+
+        int old_sense = __atomic_load_n(sense, __ATOMIC_RELAXED);
+        int old = atomicAdd(counter, 1);
+
+        if (old == group_size - 1)
+        {
+            __atomic_store_n(counter, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(sense, 1 - old_sense, __ATOMIC_RELEASE);
+        }
+        else
+        {
+            while (__atomic_load_n(sense, __ATOMIC_ACQUIRE) == old_sense) __builtin_amdgcn_s_sleep(1);
+        }
+#else
         cuda::atomic_ref<int, cuda::thread_scope_device> counter(barrier_counters_sense[group_id * 2]);
         cuda::atomic_ref<int, cuda::thread_scope_device> sense(barrier_counters_sense[group_id * 2 + 1]);
 
@@ -342,6 +465,7 @@ __device__ inline void group_barrier
         {
             while (sense.load(cuda::memory_order_acquire) == old_sense) __nanosleep(32);
         }
+#endif
     }
 
     __syncthreads();
