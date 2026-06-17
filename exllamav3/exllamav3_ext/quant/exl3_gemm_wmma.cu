@@ -135,8 +135,11 @@ void exl3_gemm_wmma_kernel
 // ---------------------------------------------------------------------------
 #define EXL3_GEMV_MAXM 8
 
+// One warp (32 threads) per block, owning a single 16-wide N block. Each block
+// is fully independent (loads its own packed block, decodes, accumulates), so
+// the LDS-ordering barriers are single-wave (cheap) rather than 8-warp.
 template <int K, int cb>
-__global__ __launch_bounds__(256)
+__global__ __launch_bounds__(32)
 void exl3_gemv_fused_kernel
 (
     const half* __restrict__ A,             // [M, K_dim]
@@ -149,18 +152,17 @@ void exl3_gemv_fused_kernel
     int kb_per_block
 )
 {
-    constexpr int packed_size = 256 * K / 16;
+    constexpr int packed_size = 256 * K / 16;       // uint16s per 16x16 block
+    constexpr int packed_int4 = packed_size / 8;    // int4s per block
 
-    int t = threadIdx.x;
-    int lane_id = t % 32;
-    int warp_id = t / 32;          // 0..7, this warp's 16-N subtile
-    int n_tile = blockIdx.x;       // 128-wide N tile
-    int n_base = n_tile * 128;
+    int lane_id = threadIdx.x;
+    int n_block = blockIdx.x;       // 16-wide N block
+    int n_base = n_block * 16;
     int kb0 = blockIdx.y * kb_per_block;
     int kb1 = min(kb0 + kb_per_block, K_dim / 16);
 
-    __shared__ uint32_t s_packed[8][packed_size / 2];
-    __shared__ half2 tile[16][8][8];
+    __shared__ uint32_t s_packed[packed_size / 2];
+    __shared__ half2 tile[16][8];   // one 16x16 block, row-major (16 K rows x 8 half2)
 
     float acc[EXL3_GEMV_MAXM];
     #pragma unroll
@@ -168,14 +170,14 @@ void exl3_gemv_fused_kernel
 
     for (int kb = kb0; kb < kb1; ++kb)
     {
-        const uint16_t* g_packed = trellis + ((size_t)(kb * packed_blocks_n) + n_tile * 8) * packed_size;
-        if (t < packed_size)
-            ((int4*) s_packed)[t] = ((const int4*) g_packed)[t];
+        const uint16_t* g_packed = trellis + ((size_t)(kb * packed_blocks_n) + n_block) * packed_size;
+        if (lane_id < packed_int4)
+            ((int4*) s_packed)[lane_id] = ((const int4*) g_packed)[lane_id];
         __syncthreads();
 
-        // Decode this warp's 16x16 N-block to row-major shared (reconstruct.cu logic)
+        // Decode this 16x16 block to row-major shared (reconstruct.cu logic)
         FragB frag[2];
-        dq_dispatch<K, cb>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
+        dq_dispatch<K, cb>(s_packed, lane_id * 8, frag[0], frag[1]);
         half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
         half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
         half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
@@ -192,21 +194,19 @@ void exl3_gemv_fused_kernel
             half2 m7 = __halves2half2(__high2half(frag[1][1]), __high2half(n3));
             int r0 = (lane_id % 4) * 2; int r1 = r0 + 1; int r2 = r0 + 8; int r3 = r0 + 9;
             int c0 = lane_id / 8; int c1 = c0 + 4;
-            tile[r0][warp_id][c0] = m0; tile[r1][warp_id][c0] = m1;
-            tile[r2][warp_id][c0] = m2; tile[r3][warp_id][c0] = m3;
-            tile[r0][warp_id][c1] = m4; tile[r1][warp_id][c1] = m5;
-            tile[r2][warp_id][c1] = m6; tile[r3][warp_id][c1] = m7;
+            tile[r0][c0] = m0; tile[r1][c0] = m1; tile[r2][c0] = m2; tile[r3][c0] = m3;
+            tile[r0][c1] = m4; tile[r1][c1] = m5; tile[r2][c1] = m6; tile[r3][c1] = m7;
         }
         __syncthreads();
 
-        // Accumulate: lane (0..15) owns N column (n_base + warp_id*16 + lane)
+        // Accumulate: lane (0..15) owns N column (n_base + lane)
         if (lane_id < 16)
         {
             int kk = kb * 16;
             #pragma unroll
             for (int k = 0; k < 16; ++k)
             {
-                float wv = __half2float(((const half*) &tile[k][warp_id][0])[lane_id]);
+                float wv = __half2float(((const half*) &tile[k][0])[lane_id]);
                 #pragma unroll
                 for (int m = 0; m < EXL3_GEMV_MAXM; ++m)
                     if (m < M) acc[m] += __half2float(A[(size_t) m * K_dim + kk + k]) * wv;
@@ -217,7 +217,7 @@ void exl3_gemv_fused_kernel
 
     if (lane_id < 16)
     {
-        int col = n_base + warp_id * 16 + lane_id;
+        int col = n_base + lane_id;
         #pragma unroll
         for (int m = 0; m < EXL3_GEMV_MAXM; ++m)
             if (m < M) atomicAdd(&C[(size_t) m * N + col], acc[m]);
@@ -315,11 +315,11 @@ void exl3_gemv_fused
     TORCH_CHECK(a.dtype() == at::kHalf, "exl3_gemv_fused: a must be fp16");
     TORCH_CHECK(c.dtype() == at::kFloat, "exl3_gemv_fused: c must be fp32");
 
-    int n_tiles = N / 128;
+    int n_blocks = N / 16;          // one warp-block per 16-wide N block
     int k_blocks = K_dim / 16;
     // Pick split-K so total blocks land in a healthy range for occupancy.
-    int target_blocks = 512;
-    int nsplit = (target_blocks + n_tiles - 1) / n_tiles;
+    static int target_blocks = []{ const char* e = getenv("EXL3_GEMV_TARGET"); return e ? atoi(e) : 2048; }();
+    int nsplit = (target_blocks + n_blocks - 1) / n_blocks;
     if (nsplit < 1) nsplit = 1;
     if (nsplit > k_blocks) nsplit = k_blocks;
     int kb_per_block = (k_blocks + nsplit - 1) / nsplit;
@@ -329,8 +329,8 @@ void exl3_gemv_fused
     if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
 
-    dim3 gridDim(n_tiles, nsplit);
-    dim3 blockDim(256);
+    dim3 gridDim(n_blocks, nsplit);
+    dim3 blockDim(32);
     auto kernel = exl3_gemv_fused_instances[cbi];
     kernel<<<gridDim, blockDim, 0, stream>>>
     (
