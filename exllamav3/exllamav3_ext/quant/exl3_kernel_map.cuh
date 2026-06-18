@@ -4,6 +4,11 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool
 int exl3_gemm_num_kernel_shapes();
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits);
 
+// Dynamic shared memory (in bytes) required by the GEMM/MGEMM kernel for a given shape and bit width.
+// Mirrors the shared memory layout in exl3_gemm_kernel_inner so the host can size launches correctly
+// and skip shapes that exceed a device's shared memory limit.
+size_t exl3_gemm_required_smem(int shape_idx, int bits);
+
 #define EXL3_GEMM_T_ARGS \
     const int bits, \
     const bool c_fp32, \
@@ -55,6 +60,10 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 #define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16
 #define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512
 #define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256
+
+// Pipeline depth (SH_STAGES) per shape, taken from the EXL3_GEMM_SHAPE_* definitions above.
+// Used to compute each shape's dynamic shared memory requirement on the host.
+#define EXL3_GEMM_SH_STAGES  0, 6, 4, 4, 4
 
 #define EXL3_GEMM_NUM_SHAPES 4
 

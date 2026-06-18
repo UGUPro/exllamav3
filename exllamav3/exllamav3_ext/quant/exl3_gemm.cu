@@ -209,9 +209,24 @@ int exl3_gemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
+        // Dynamic shared memory to request at launch. Kernels allocate only the shared memory their
+        // shape needs, so we request the largest requirement among the compatible shapes that fit this
+        // device. Shapes needing more than the device allows are excluded as candidates (otherwise the
+        // launch would request more shared memory than exists, failing on e.g. RDNA's 64 KB LDS).
+        int max_smem = DevCtx::instance().get_max_smem(device);
+        size_t launch_smem = 0;
+        for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES; ++s)
+        {
+            if (!exl3_gemm_shape_compat(s, size_m, size_k, size_n, K)) continue;
+            size_t req = exl3_gemm_required_smem(s, K);
+            if (req > (size_t) max_smem) continue;
+            launch_smem = MAX(launch_smem, req);
+        }
+        TORCH_CHECK(launch_smem > 0, "exl3_gemm: no compatible kernel shape fits in device shared memory");
+
         uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb);
         CoopAutotuneLaunch tuned;
-        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
+        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, launch_smem, stream, &tuned))
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
@@ -221,6 +236,7 @@ int exl3_gemm_gr
         for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
         {
             if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K)) continue;
+            if (exl3_gemm_required_smem(candidate_shape_idx, K) > (size_t) max_smem) continue;
 
             fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb);
             if (!candidate_kernel) continue;
@@ -242,7 +258,7 @@ int exl3_gemm_gr
         }
         TORCH_CHECK(!candidates.empty(), "exl3_gemm autotune: no compatible kernel shapes");
 
-        tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, SMEM_MAX, stream, (size_t) size_k * size_n);
+        tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, launch_smem, stream, (size_t) size_k * size_n);
         if (graph)
         add_graph_args((void*) tuned.kernel);
         cuda_check(cudaPeekAtLastError());
@@ -257,10 +273,11 @@ int exl3_gemm_gr
     );
     if (!kernel) return 0;
 
-    // Launch
+    // Launch. Request only the shared memory this shape needs (see exl3_gemm_required_smem).
+    size_t launch_smem = exl3_gemm_required_smem(shape_idx, K);
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) launch_smem);
         kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
@@ -270,7 +287,7 @@ int exl3_gemm_gr
         num_sms,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        launch_smem,
         stream
     );
     add_graph_args((void*) kernel);
@@ -451,13 +468,26 @@ int exl3_mgemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
+        // See the matching comment in exl3_gemm_gr: request only as much dynamic shared memory as the
+        // surviving shapes need, and drop shapes that exceed the device's shared memory limit.
+        int max_smem = DevCtx::instance().get_max_smem(device);
+        size_t launch_smem = 0;
+        for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES; ++s)
+        {
+            if (!exl3_gemm_shape_compat(s, size_m, size_k, size_n, K)) continue;
+            size_t req = exl3_gemm_required_smem(s, K);
+            if (req > (size_t) max_smem) continue;
+            launch_smem = MAX(launch_smem, req);
+        }
+        TORCH_CHECK(launch_smem > 0, "exl3_mgemm: no compatible kernel shape fits in device shared memory");
+
         uint64_t autotune_key = mgemm_autotune_hash
         (
             size_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out
         );
 
         CoopAutotuneLaunch tuned;
-        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
+        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, launch_smem, stream, &tuned))
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
@@ -469,6 +499,7 @@ int exl3_mgemm_gr
             for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
             {
                 if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K)) continue;
+                if (exl3_gemm_required_smem(candidate_shape_idx, K) > (size_t) max_smem) continue;
 
                 fp_exl3_mgemm_kernel candidate_kernel = get_mgemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb);
                 if (!candidate_kernel) continue;
@@ -490,7 +521,7 @@ int exl3_mgemm_gr
             }
             TORCH_CHECK(!candidates.empty(), "exl3_mgemm autotune: no compatible kernel shapes");
 
-            tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, SMEM_MAX, stream, (size_t) size_k * size_n * bszm);
+            tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, launch_smem, stream, (size_t) size_k * size_n * bszm);
             add_graph_args((void*) tuned.kernel);
 
             // DBGI10(size_m, size_k, size_n, K, bszm_in, bszm_out, tuned.tag, tuned.block_dim, tuned.num_sms, tuned.concurrency);
@@ -519,10 +550,11 @@ int exl3_mgemm_gr
     // Launch bigger grid if possible
     dim3 block_grid(num_sms, 1, concurrency);
 
-    // Launch
+    // Launch. Request only the shared memory this shape needs (see exl3_gemm_required_smem).
+    size_t launch_smem = exl3_gemm_required_smem(shape_idx, K);
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) launch_smem);
         kernel_attr_set[device].insert((void*) kernel);
     }
 
@@ -532,7 +564,7 @@ int exl3_mgemm_gr
         block_grid,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        launch_smem,
         stream
     );
     add_graph_args((void*) kernel);

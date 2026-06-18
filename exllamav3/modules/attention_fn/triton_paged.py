@@ -28,6 +28,36 @@ def _is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
 
 
+_max_shared_mem_cache: dict[int, int] = {}
+
+
+def _device_max_shared_mem(device: torch.device) -> int:
+    """Max dynamic shared memory per block on `device`, cached per device index.
+
+    Needed because the paged-attn kernels stage K/V tiles of block_n*(head_dim+block_dv)
+    halfs in shared memory; on RDNA/ROCm that budget is 64 KB (vs up to ~100-228 KB on
+    recent NVIDIA), so block_n must be clamped to fit or the kernel fails to launch.
+    """
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _max_shared_mem_cache.get(idx)
+    if cached is None:
+        try:
+            cached = int(triton.runtime.driver.active.utils.get_device_properties(idx)["max_shared_mem"])
+        except Exception:
+            cached = 64 * 1024  # Conservative floor (RDNA LDS size)
+        _max_shared_mem_cache[idx] = cached
+    return cached
+
+
+def _fit_block_n(block_n: int, head_dim: int, block_dv: int, device: torch.device) -> int:
+    """Largest power-of-two <= block_n whose K/V shared-memory tile fits the device limit."""
+    max_smem = _device_max_shared_mem(device)
+    # Shared memory is dominated by the half-precision K and V tiles staged per step.
+    while block_n > 16 and block_n * (head_dim + block_dv) * 2 > max_smem:
+        block_n //= 2
+    return block_n
+
+
 @triton.jit
 def _paged_kv_update_kernel(
     k,
@@ -391,6 +421,8 @@ def paged_attn_triton(
             raise ValueError(f"{name} must be a power of two")
     if block_dv > head_dim:
         block_dv = head_dim
+    # Clamp block_n so the staged K/V shared-memory tile fits the device (e.g. 64 KB on ROCm/RDNA).
+    block_n = _fit_block_n(block_n, head_dim, block_dv, q.device)
     num_pages_per_seq = block_table.shape[1]
 
     with torch.cuda.device(q.device):
@@ -537,6 +569,8 @@ def paged_attn_triton_longq(
             raise ValueError(f"{name} must be a power of two")
     if block_dv > head_dim:
         block_dv = head_dim
+    # Clamp block_n so the staged K/V shared-memory tile fits the device (e.g. 64 KB on ROCm/RDNA).
+    block_n = _fit_block_n(block_n, head_dim, block_dv, q.device)
 
     num_pages_per_seq = block_table.shape[1]
     with torch.cuda.device(q.device):

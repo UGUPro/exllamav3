@@ -6,14 +6,83 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
+# Fused exl3 GEMM block kernels (exl3_mgemm) use tensor-core PTX and are
+# unavailable on ROCm; keep these contexts unbuilt so the module falls back to
+# the per-linear path, matching the gating in attn.py / mlp.py.
+IS_ROCM = torch.version.hip is not None
 try:
     from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
 except (ImportError, ModuleNotFoundError):
-    # flash-attn is unavailable on ROCm/RDNA; these names are only used by
-    # sliding-window / arch-specific paths that fall back elsewhere.
-    flash_attn_func = None
-    flash_attn_with_kvcache = None
+    # flash-attn is unavailable on ROCm/RDNA. The regular Attention module routes
+    # through attn_dispatch (which has triton/torch fallbacks), but sliding-window
+    # attention calls these flash entry points directly. Provide pure-torch
+    # equivalents so sliding-window models (e.g. Gemma) run without flash-attn.
+    #
+    # Window masking is purely relative: flash_attn_with_kvcache treats the `sq`
+    # query tokens as the *last* `sq` valid keys once new k/v are written into the
+    # cache, so query i sits at key index (tk - sq + i). We replicate that exactly
+    # with an additive mask, matching flash's window_size=(left, right) convention
+    # (key kept iff -right <= query_pos - key_pos <= left; -1 means unbounded).
     flash_attn_varlen_func = None
+
+    def _torch_windowed_attn(q, k_full, v_full, qi_start, causal, left, right,
+                             sm_scale, softcap):
+        # q: (b, sq, hq, d); k_full/v_full: (b, tk, hk, d) -> out: (b, sq, hq, d)
+        b, sq, hq, d = q.shape
+        tk = k_full.shape[1]
+        hk = k_full.shape[2]
+        qf = q.transpose(1, 2).float()        # (b, hq, sq, d)
+        kf = k_full.transpose(1, 2).float()   # (b, hk, tk, d)
+        vf = v_full.transpose(1, 2).float()
+        if hk != hq:                          # GQA: expand kv heads to match q
+            rep = hq // hk
+            kf = kf.repeat_interleave(rep, dim=1)
+            vf = vf.repeat_interleave(rep, dim=1)
+        scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale   # (b, hq, sq, tk)
+        if softcap and softcap > 0:
+            scores = softcap * torch.tanh(scores / softcap)
+        device = q.device
+        qi = qi_start + torch.arange(sq, device=device).unsqueeze(1)   # (sq, 1)
+        j = torch.arange(tk, device=device).unsqueeze(0)               # (1, tk)
+        rel = qi - j                                                   # (sq, tk)
+        allowed = torch.ones_like(rel, dtype=torch.bool)
+        if causal:
+            allowed &= rel >= 0
+        if left is not None and left >= 0:
+            allowed &= rel <= left
+        if right is not None and right >= 0:
+            allowed &= rel >= -right
+        scores.masked_fill_(~allowed.unsqueeze(0).unsqueeze(0), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        o = torch.matmul(probs, vf)           # (b, hq, sq, d)
+        return o.transpose(1, 2).contiguous().to(q.dtype)
+
+    def flash_attn_with_kvcache(q, k=None, v=None, k_cache=None, v_cache=None,
+                                causal=True, cache_seqlens=None, softmax_scale=None,
+                                window_size=(-1, -1), softcap=0.0):
+        if torch.is_tensor(cache_seqlens):
+            cs = int(cache_seqlens.reshape(-1)[0].item())
+        else:
+            cs = int(cache_seqlens)
+        sq = q.shape[1]
+        if k is not None:                     # append new k/v into the cache in place
+            sk = k.shape[1]
+            k_cache[:, cs:cs + sk] = k
+            v_cache[:, cs:cs + sk] = v
+            tk = cs + sk
+        else:                                 # new k/v already staged in the cache
+            tk = cs
+        left, right = window_size
+        sm = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+        return _torch_windowed_attn(q, k_cache[:, :tk], v_cache[:, :tk],
+                                    tk - sq, causal, left, right, sm, softcap)
+
+    def flash_attn_func(q, k=None, v=None, causal=True, softmax_scale=None,
+                        window_size=(-1, -1), softcap=0.0):
+        # No cache: q and k are aligned (query i at position i)
+        left, right = window_size
+        sm = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+        return _torch_windowed_attn(q, k, v, 0, causal, left, right, sm, softcap)
 
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
@@ -407,7 +476,7 @@ class SlidingAttention(Module):
 
         # Test if K and V proj can be fused
         if (
-            device != torch.device("cpu") and
+            device != torch.device("cpu") and not IS_ROCM and
             self.k_proj.quant_type == "exl3" and
             self.v_proj.quant_type == "exl3" and
             self.k_proj.out_features == self.v_proj.out_features and
@@ -422,7 +491,7 @@ class SlidingAttention(Module):
         # Test if Q and G proj can be fused
         if (
             self.g_proj is not None and
-            device != torch.device("cpu") and
+            device != torch.device("cpu") and not IS_ROCM and
             self.q_proj.quant_type == "exl3" and
             self.g_proj.quant_type == "exl3" and
             self.q_proj.out_features == self.g_proj.out_features and
