@@ -25,6 +25,7 @@ class DevCtx
 private:
     int num_sms[MAX_DEVICES] = {};
     int cc[MAX_DEVICES] = {};
+    int max_smem[MAX_DEVICES] = {};
     void* locks[MAX_DEVICES] = {};
     void* ws[MAX_DEVICES] = {};
     std::mutex mtx;
@@ -33,6 +34,7 @@ public:
     static DevCtx& instance();
     int get_num_sms(int device);
     int get_cc(int device);
+    int get_max_smem(int device);
     void* get_ws(int device);
     int* get_locks(int device);
 

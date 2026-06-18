@@ -82,6 +82,28 @@ int exl3_gemm_num_kernel_shapes()
 int exl3_gemm_tilesize_k[] = {EXL3_GEMM_TILESIZE_K};
 int exl3_gemm_tilesize_n[] = {EXL3_GEMM_TILESIZE_N};
 int exl3_gemm_blockdim[] = {EXL3_GEMM_BLOCKDIM};
+int exl3_gemm_sh_stages[] = {EXL3_GEMM_SH_STAGES};
+
+size_t exl3_gemm_required_smem(int shape_idx, int bits)
+{
+    // Mirrors the shared memory layout in exl3_gemm_kernel_inner (exl3_gemm_inner.cuh). All shapes use
+    // TILESIZE_M == 16. The sh_c term uses the larger (shmem_out_had) variant so the result is a safe
+    // upper bound regardless of which kernel variant is launched.
+    const int TILESIZE_M = 16;
+    int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
+    int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
+    int sh_stages = exl3_gemm_sh_stages[shape_idx];
+
+    int tileblocks_k = tilesize_k / 16;
+    int tileblocks_n = tilesize_n / 16;
+    int frags_n_per_warp = 2 * tileblocks_n / (EXL3_GEMM_BASE_THREADS / 32);
+
+    int sh_a_stage_size = TILESIZE_M * tilesize_k;                          // halfs
+    int sh_b_stage_size = tileblocks_k * tileblocks_n * 256 / 16 * bits;    // uint16s
+    int sh_c_size = MAX(4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp, tilesize_n * TILESIZE_M);  // floats
+
+    return (size_t) sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + (size_t) 4 * sh_c_size;
+}
 
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int K)
 {

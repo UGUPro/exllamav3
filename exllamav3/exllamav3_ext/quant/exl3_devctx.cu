@@ -45,6 +45,22 @@ int DevCtx::get_cc(int device)
     return cc[device];
 }
 
+int DevCtx::get_max_smem(int device)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!max_smem[device])
+    {
+        // Maximum dynamic shared memory a kernel may opt into on this device. On NVIDIA this is the
+        // "max optin" size (e.g. 99 KB on CC 8.6); on RDNA/ROCm it is the LDS size per workgroup
+        // (64 KB on gfx11xx). The exl3 GEMM launches dynamic shared memory and must not request more
+        // than the device allows, or hipFuncSetAttribute/cudaFuncSetAttribute fails with invalid argument.
+        cudaDeviceProp prop;
+        cuda_check(cudaGetDeviceProperties(&prop, device));
+        max_smem[device] = (int) prop.sharedMemPerBlockOptin;
+    }
+    return max_smem[device];
+}
+
 void* DevCtx::get_ws(int device)
 {
     std::lock_guard<std::mutex> lock(mtx);
