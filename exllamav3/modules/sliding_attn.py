@@ -10,7 +10,15 @@ from ..constants import PAGE_SIZE
 # unavailable on ROCm; keep these contexts unbuilt so the module falls back to
 # the per-linear path, matching the gating in attn.py / mlp.py.
 IS_ROCM = torch.version.hip is not None
+# On ROCm the SWA path here calls flash_attn_with_kvcache directly. The aiter
+# Triton backend is broken on gfx1151 (returns garbage / faults the GPU on the
+# 2nd job), while the CK backend is correct; rocm_flash_disabled() forces the
+# pure-torch fallback below unless a working CK backend is present (or the user
+# opts in via EXLLAMA_ROCM_ALLOW_FLASH). See exllamav3/util/rocm_flash.py.
+from ..util.rocm_flash import rocm_flash_disabled
 try:
+    if rocm_flash_disabled():
+        raise ImportError("flash-attn disabled on ROCm (no working CK backend)")
     from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
 except (ImportError, ModuleNotFoundError):
     # flash-attn is unavailable on ROCm/RDNA. The regular Attention module routes

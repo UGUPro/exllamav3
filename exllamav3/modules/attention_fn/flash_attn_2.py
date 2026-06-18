@@ -1,10 +1,20 @@
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
+from ...util.rocm_flash import rocm_flash_disabled
 
 # flash-attn is unavailable on some platforms (e.g. ROCm/RDNA). When it can't be
 # imported these backends simply return None and the dispatcher falls through to
 # the next candidate (xformers / triton paged / torch SDPA).
+#
+# On ROCm there are two backends and they behave very differently on RDNA: the
+# aiter Triton backend is BROKEN on gfx1151 (its kvcache kernel corrupts GPU/queue
+# state -> garbage output, cross-request KV contamination, GPU faults), while the
+# Composable Kernel (CK) backend is correct and faster. dispatch.py selects flash
+# first whenever importable, so rocm_flash_disabled() gates it: on ROCm flash is
+# used only when the CK backend is present (overridable via EXLLAMA_ROCM_ALLOW_FLASH).
 try:
+    if rocm_flash_disabled():
+        raise ImportError("flash-attn disabled on ROCm (no working CK backend)")
     from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
     has_flash_attn = True
 except (ImportError, ModuleNotFoundError):
