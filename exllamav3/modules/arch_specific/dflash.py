@@ -1,8 +1,14 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
+# On ROCm, only the CK flash backend is safe (the aiter Triton one corrupts GPU
+# state); see exllamav3/util/rocm_flash.py.
+from ...util.rocm_flash import rocm_flash_disabled
 try:
+    if rocm_flash_disabled():
+        raise ImportError("flash-attn disabled on ROCm (no working CK backend)")
     from flash_attn import flash_attn_with_kvcache
 except (ImportError, ModuleNotFoundError):
     # flash-attn is unavailable on ROCm/RDNA; these names are only used by
